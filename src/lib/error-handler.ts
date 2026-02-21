@@ -24,10 +24,43 @@ export interface ErrorHandlerOptions {
 }
 
 /**
+ * 即梦生成任务 failCode 错误码映射表
+ * 这些错误码来自轮询生成任务状态时服务端返回的 failCode 字段
+ */
+const FAIL_CODE_MAP: Record<string, string> = {
+  // 内容审核相关
+  '2038': '输入的文字不符合平台规则，请修改后重试',
+  '2043': '生成的内容不符合平台规则，已被拦截',
+  '2044': '输入的图片不符合平台规则，请更换图片后重试',
+  '2045': '输入的视频不符合平台规则，请更换视频后重试',
+
+  // 资源/配额相关
+  '5000': '即梦积分不足，请充值或更换账号',
+  '5001': '服务端生成失败，请稍后重试',
+  '5002': '视频生成失败，服务端内部错误',
+
+  // 参数/格式相关
+  '1000': '请求参数无效 (invalid parameter)',
+  '1019': 'TLS指纹校验失败 (shark not pass)，请确认 browser_proxy 是否正常运行',
+
+  // 超时/排队相关
+  '3001': '生成任务超时，服务器繁忙，请稍后重试',
+  '3002': '排队超时，当前用户过多，请稍后重试',
+};
+
+/**
+ * 根据 failCode 获取用户友好的错误信息
+ */
+function getFailCodeMessage(failCode: string | undefined): string {
+  if (!failCode) return '未知错误';
+  return FAIL_CODE_MAP[failCode] || `未知错误码 ${failCode}（请在即梦官网查看该错误码含义）`;
+}
+
+/**
  * 统一的即梦API错误处理器
  */
 export class JimengErrorHandler {
-  
+
   /**
    * 处理即梦API响应错误
    */
@@ -143,9 +176,10 @@ export class JimengErrorHandler {
     }
 
     // 没有任何结果时，记录错误并抛出异常
-    logger.error(message);
+    const failMessage = getFailCodeMessage(failCode);
+    logger.error(`${message}, meaning=${failMessage}`);
     const exception = type === 'image' ? EX.API_IMAGE_GENERATION_FAILED : EX.API_VIDEO_GENERATION_FAILED;
-    throw new APIException(exception, `${typeText}生成失败，状态码: ${status}${failCode ? `，错误码: ${failCode}` : ''}`);
+    throw new APIException(exception, `${typeText}生成失败: ${failMessage}${failCode ? ` (错误码: ${failCode})` : ''}`);
   }
   
   /**

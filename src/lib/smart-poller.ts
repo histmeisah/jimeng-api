@@ -8,6 +8,7 @@ import { handlePollingTimeout, handleGenerationFailure } from "@/lib/error-handl
 export interface PollingStatus {
   status: number;
   failCode?: string;
+  statusText?: string;
   itemCount: number;
   finishTime?: number;
   historyId?: string;
@@ -183,7 +184,8 @@ export class SmartPoller {
 
           // 处理失败情况 (如果有部分结果，handleGenerationFailure 会返回 false 而不抛出异常)
           if (status.status === 30) {
-            handleGenerationFailure(status.status, status.failCode, historyId, this.options.type, status.itemCount);
+            logger.error(`Generation failed with status 30. Full status: ${JSON.stringify(status)}`);
+            handleGenerationFailure(status.status, status.statusText || status.failCode, historyId, this.options.type, status.itemCount);
           }
 
           // 处理超时情况

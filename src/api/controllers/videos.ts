@@ -12,6 +12,7 @@ import { SmartPoller, PollingStatus } from "@/lib/smart-poller.ts";
 import { DEFAULT_ASSISTANT_ID_CN, DEFAULT_ASSISTANT_ID_US, DEFAULT_ASSISTANT_ID_HK, DEFAULT_ASSISTANT_ID_JP, DEFAULT_ASSISTANT_ID_SG, DEFAULT_VIDEO_MODEL, DRAFT_VERSION, DRAFT_VERSION_OMNI, OMNI_BENEFIT_TYPE, OMNI_BENEFIT_TYPE_FAST, VIDEO_MODEL_MAP, VIDEO_MODEL_MAP_US, VIDEO_MODEL_MAP_ASIA } from "@/api/consts/common.ts";
 import { uploadImageBuffer, ImageUploadResult } from "@/lib/image-uploader.ts";
 import { uploadVideoBuffer, VideoUploadResult } from "@/lib/video-uploader.ts";
+import { uploadAudioBuffer, uploadAudioFromUrl, AudioUploadResult } from "@/lib/audio-uploader.ts";
 import { extractVideoUrl, fetchHighQualityVideoUrl } from "@/lib/image-utils.ts";
 import { uploadVideoFromUrl } from "@/lib/video-uploader.ts";
 
@@ -264,7 +265,7 @@ export async function generateVideo(
     // 素材注册表: fieldName → { idx, type, uploadResult }
     interface MaterialEntry {
       idx: number;
-      type: "image" | "video";
+      type: "image" | "video" | "audio";
       fieldName: string;
       originalFilename: string;
       imageUri?: string;
@@ -272,6 +273,7 @@ export async function generateVideo(
       imageHeight?: number;
       imageFormat?: string;
       videoResult?: VideoUploadResult;
+      audioResult?: AudioUploadResult;
     }
     const materialRegistry: Map<string, MaterialEntry> = new Map();
     let materialIdx = 0;
@@ -280,8 +282,18 @@ export async function generateVideo(
     const canonicalKeys = new Set<string>();
     canonicalKeys.add('image_file');
     canonicalKeys.add('video_file');
-    for (let i = 1; i <= 9; i++) canonicalKeys.add(`image_file_${i}`);
-    for (let i = 1; i <= 3; i++) canonicalKeys.add(`video_file_${i}`);
+    for (let i = 1; i <= 9; i++) {
+      canonicalKeys.add(`image_file_${i}`);
+      canonicalKeys.add(`图片${i}`);
+    }
+    for (let i = 1; i <= 3; i++) {
+      canonicalKeys.add(`video_file_${i}`);
+      canonicalKeys.add(`视频${i}`);
+    }
+    for (let i = 1; i <= 3; i++) {
+      canonicalKeys.add(`audio_file_${i}`);
+      canonicalKeys.add(`音频${i}`);
+    }
 
     // 安全注册别名：originalFilename 不与 canonical key 冲突时才注册
     function registerAlias(filename: string, entry: MaterialEntry) {
@@ -290,15 +302,28 @@ export async function generateVideo(
       }
     }
 
+    // 注册中文别名：按类型的序号映射到中文名
+    const chineseCounters = { image: 0, video: 0, audio: 0 };
+    function registerChineseAlias(type: "image" | "video" | "audio", entry: MaterialEntry) {
+      chineseCounters[type]++;
+      const prefix = type === "image" ? "图片" : type === "video" ? "视频" : "音频";
+      const alias = `${prefix}${chineseCounters[type]}`;
+      if (!materialRegistry.has(alias)) {
+        materialRegistry.set(alias, entry);
+      }
+    }
+
     // 收集所有需要处理的图片和视频字段
     const imageFields: string[] = [];
     const videoFields: string[] = [];
+    const audioFields: string[] = [];
 
     // 检测上传的文件
     if (files) {
       for (const fieldName of Object.keys(files)) {
         if (fieldName === 'image_file' || fieldName.startsWith('image_file_')) imageFields.push(fieldName);
         else if (fieldName === 'video_file' || fieldName.startsWith('video_file_')) videoFields.push(fieldName);
+        else if (fieldName.startsWith('audio_file_')) audioFields.push(fieldName);
       }
     }
 
@@ -315,6 +340,12 @@ export async function generateVideo(
         if (!videoFields.includes(fieldName)) videoFields.push(fieldName);
       }
     }
+    for (let i = 1; i <= 3; i++) {
+      const fieldName = `audio_file_${i}`;
+      if (typeof httpRequest?.body?.[fieldName] === 'string' && httpRequest.body[fieldName].startsWith('http')) {
+        if (!audioFields.includes(fieldName)) audioFields.push(fieldName);
+      }
+    }
     // 检测不带数字后缀的裸名 URL 字段
     if (typeof httpRequest?.body?.image_file === 'string' && httpRequest.body.image_file.startsWith('http')) {
       if (!imageFields.includes('image_file')) imageFields.push('image_file');
@@ -325,9 +356,9 @@ export async function generateVideo(
 
     // 检查是否有素材
     const hasFilePaths = filePaths && filePaths.length > 0;
-    if (imageFields.length === 0 && videoFields.length === 0 && !hasFilePaths) {
+    if (imageFields.length === 0 && videoFields.length === 0 && audioFields.length === 0 && !hasFilePaths) {
       throw new APIException(EX.API_REQUEST_FAILED,
-        `omni_reference 模式需要至少上传一个素材文件 (image_file_*, video_file_*) 或提供素材URL`);
+        `omni_reference 模式需要至少上传一个素材文件 (image_file_*, video_file_*, audio_file_*) 或提供素材URL`);
     }
 
     let totalVideoDuration = 0; // 累计视频时长
@@ -358,6 +389,7 @@ export async function generateVideo(
           };
           materialRegistry.set(fieldName, entry);
           registerAlias(imageFile.originalFilename, entry);
+          registerChineseAlias("image", entry);
           logger.info(`[omni] ${fieldName} 上传成功: ${imgResult.uri} (${imgResult.width}x${imgResult.height})`);
         } else if (imageUrlField && typeof imageUrlField === 'string' && imageUrlField.startsWith('http')) {
           // URL上传
@@ -374,6 +406,7 @@ export async function generateVideo(
             imageFormat: imgResult.format,
           };
           materialRegistry.set(fieldName, entry);
+          registerChineseAlias("image", entry);
           logger.info(`[omni] ${fieldName} URL上传成功: ${imgResult.uri} (${imgResult.width}x${imgResult.height})`);
         }
       } catch (error: any) {
@@ -407,6 +440,7 @@ export async function generateVideo(
             imageFormat: imgResult.format,
           };
           materialRegistry.set(fieldName, entry);
+          registerChineseAlias("image", entry);
           logger.info(`[omni] ${fieldName} URL上传成功: ${imgResult.uri} (${imgResult.width}x${imgResult.height})`);
         } catch (error: any) {
           throw new APIException(EX.API_REQUEST_FAILED, `${fieldName} URL图片处理失败: ${error.message}`);
@@ -438,6 +472,7 @@ export async function generateVideo(
           };
           materialRegistry.set(fieldName, entry);
           registerAlias(videoFile.originalFilename, entry);
+          registerChineseAlias("video", entry);
           logger.info(`[omni] ${fieldName} 上传成功: vid=${vResult.vid}, ${vResult.videoMeta.width}x${vResult.videoMeta.height}, ${vResult.videoMeta.duration}s`);
         } else if (videoUrlField && typeof videoUrlField === 'string' && videoUrlField.startsWith('http')) {
           // URL上传
@@ -451,11 +486,68 @@ export async function generateVideo(
             videoResult: vResult
           };
           materialRegistry.set(fieldName, entry);
+          registerChineseAlias("video", entry);
           logger.info(`[omni] ${fieldName} URL上传成功: vid=${vResult.vid}, ${vResult.videoMeta.width}x${vResult.videoMeta.height}, ${vResult.videoMeta.duration}s`);
         }
       } catch (error: any) {
         throw new APIException(EX.API_REQUEST_FAILED, `${fieldName} 处理失败: ${error.message}`);
       }
+    }
+
+    // 串行上传音频素材
+    let totalAudioDuration = 0;
+    for (const fieldName of audioFields) {
+      const audioFile = files?.[fieldName];
+      const audioUrlField = httpRequest?.body?.[fieldName];
+
+      try {
+        logger.info(`[omni] 上传 ${fieldName}`);
+        let aResult: AudioUploadResult;
+
+        if (audioFile) {
+          // 本地文件上传
+          const buf = await fs.readFile(audioFile.filepath);
+          aResult = await uploadAudioBuffer(buf, refreshToken, regionInfo);
+          totalAudioDuration += aResult.audioMeta.duration;
+          const entry: MaterialEntry = {
+            idx: materialIdx++,
+            type: "audio",
+            fieldName,
+            originalFilename: audioFile.originalFilename,
+            audioResult: aResult
+          };
+          materialRegistry.set(fieldName, entry);
+          registerAlias(audioFile.originalFilename, entry);
+          registerChineseAlias("audio", entry);
+          logger.info(`[omni] ${fieldName} 上传成功: vid=${aResult.vid}, ${aResult.audioMeta.duration}s`);
+        } else if (audioUrlField && typeof audioUrlField === 'string' && audioUrlField.startsWith('http')) {
+          // URL上传
+          aResult = await uploadAudioFromUrl(audioUrlField, refreshToken, regionInfo);
+          totalAudioDuration += aResult.audioMeta.duration;
+          const entry: MaterialEntry = {
+            idx: materialIdx++,
+            type: "audio",
+            fieldName,
+            originalFilename: audioUrlField,
+            audioResult: aResult
+          };
+          materialRegistry.set(fieldName, entry);
+          registerChineseAlias("audio", entry);
+          logger.info(`[omni] ${fieldName} URL上传成功: vid=${aResult.vid}, ${aResult.audioMeta.duration}s`);
+        }
+      } catch (error: any) {
+        throw new APIException(EX.API_REQUEST_FAILED, `${fieldName} 处理失败: ${error.message}`);
+      }
+    }
+
+    // 验证音频总时长
+    const MAX_TOTAL_AUDIO_DURATION = 15;
+    if (totalAudioDuration > MAX_TOTAL_AUDIO_DURATION) {
+      throw new APIException(EX.API_REQUEST_FAILED,
+        `音频总时长 ${totalAudioDuration.toFixed(2)}s 超过限制 (最大 ${MAX_TOTAL_AUDIO_DURATION}s)`);
+    }
+    if (audioFields.length > 0) {
+      logger.info(`[omni] 音频总时长: ${totalAudioDuration.toFixed(2)}s`);
     }
 
     // 验证视频总时长
@@ -498,7 +590,7 @@ export async function generateVideo(
           },
         });
         materialTypes.push(1);
-      } else {
+      } else if (entry.type === "video") {
         const vm = entry.videoResult!;
         material_list.push({
           type: "",
@@ -517,6 +609,22 @@ export async function generateVideo(
           },
         });
         materialTypes.push(2);
+      } else if (entry.type === "audio") {
+        const am = entry.audioResult!;
+        material_list.push({
+          type: "",
+          id: util.uuid(),
+          material_type: "audio",
+          audio_info: {
+            type: "audio",
+            id: util.uuid(),
+            source_from: "upload",
+            vid: am.vid,
+            duration: Math.round(am.audioMeta.duration * 1000),
+            name: "",
+          },
+        });
+        materialTypes.push(3);  // 3 = audio
       }
     }
 
@@ -841,19 +949,47 @@ export async function generateVideo(
     };
   }
 
-  // 发送请求
+  // 发送请求（带 shark 重试逻辑）
   const videoReferer = regionInfo.isCN
     ? "https://jimeng.jianying.com/ai-tool/generate?type=video"
     : "https://dreamina.capcut.com/ai-tool/generate?type=video";
-  const { aigc_data } = await request(
-    "post",
-    "/mweb/v1/aigc_draft/generate",
-    refreshToken,
-    {
-      ...requestData,
-      headers: { Referer: videoReferer },
+  const SHARK_MAX_RETRIES = 5;
+  const SHARK_BASE_DELAY = 8000;
+  let aigc_data: any;
+
+  for (let sharkAttempt = 0; sharkAttempt <= SHARK_MAX_RETRIES; sharkAttempt++) {
+    try {
+      if (sharkAttempt > 0) {
+        const delay = SHARK_BASE_DELAY + sharkAttempt * 4000 + Math.floor(Math.random() * 4000 - 2000);
+        logger.info(`[shark重试] 第 ${sharkAttempt} 次重试，等待 ${(delay / 1000).toFixed(1)} 秒...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        if (requestData.data && requestData.data.submit_id) {
+          requestData.data.submit_id = util.uuid();
+        }
+      }
+      const result = await request(
+        "post",
+        "/mweb/v1/aigc_draft/generate",
+        refreshToken,
+        {
+          ...requestData,
+          headers: { Referer: videoReferer },
+        }
+      );
+      aigc_data = result.aigc_data;
+      break;
+    } catch (error: any) {
+      const isSharkError = error.message && (
+        error.message.includes('shark not pass') ||
+        error.message.includes('1019')
+      );
+      if (isSharkError && sharkAttempt < SHARK_MAX_RETRIES) {
+        logger.warn(`[shark重试] shark not pass (尝试 ${sharkAttempt + 1}/${SHARK_MAX_RETRIES + 1})，将重试...`);
+        continue;
+      }
+      throw error;
     }
-  );
+  }
 
   const historyId = aigc_data.history_record_id;
   if (!historyId)

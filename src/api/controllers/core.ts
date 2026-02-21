@@ -40,6 +40,46 @@ const DEVICE_ID = Math.random() * 999999999999999999 + 7000000000000000000;
 const WEB_ID = Math.random() * 999999999999999999 + 7000000000000000000;
 // 用户ID（32位hex，无横线）
 const USER_ID = util.uuid(false);
+// ttwid 缓存
+let cachedTtwid: string | null = null;
+
+/**
+ * 获取 ttwid cookie（shark 验证所需）
+ * 通过 ByteDance 的 ttwid 注册接口获取
+ */
+async function getTtwid(): Promise<string> {
+  if (cachedTtwid) return cachedTtwid;
+  try {
+    const resp = await axios.post(
+      "https://ttwid.bytedance.com/ttwid/union/register/",
+      {
+        region: "cn",
+        aid: 513695,
+        needFid: false,
+        service: "jimeng.jianying.com",
+        migrate_info: { ticket: "", source: "node" },
+        cbUrlProtocol: "https",
+        union: true,
+      },
+      { timeout: 10000, headers: { "Content-Type": "application/json" } }
+    );
+    const setCookie = resp.headers["set-cookie"];
+    if (setCookie) {
+      for (const c of setCookie) {
+        const match = c.match(/ttwid=([^;]+)/);
+        if (match) {
+          cachedTtwid = match[1];
+          logger.info(`ttwid 获取成功: ${cachedTtwid.substring(0, 20)}...`);
+          return cachedTtwid;
+        }
+      }
+    }
+    logger.warn("ttwid 注册响应中未找到 ttwid cookie");
+  } catch (e: any) {
+    logger.warn(`ttwid 获取失败: ${e.message}`);
+  }
+  return "";
+}
 // 伪装headers
 const FAKE_HEADERS = {
   Accept: "application/json, text/plain, */*",
@@ -157,15 +197,52 @@ export function getAssistantId(regionInfo: RegionInfo): number {
 
 /**
  * 生成cookie
+ *
+ * 如果设置了 BROWSER_COOKIES 环境变量，直接使用浏览器导出的完整 cookie
+ * （通过 shark 验证的关键：包含 msToken、__ac_signature 等浏览器生成的 cookie）
+ * 否则回退到基础 cookie 生成
  */
-export function generateCookie(refreshToken: string) {
+export async function generateCookie(refreshToken: string) {
   const { token: tokenWithRegion } = parseProxyFromToken(refreshToken);
   const { isUS, isHK, isJP, isSG } = parseRegionFromToken(tokenWithRegion);
   const token = (isUS || isHK || isJP || isSG)
     ? tokenWithRegion.substring(3)
     : tokenWithRegion;
 
-  return [
+  // 优先使用浏览器导出的完整 cookie（包含 shark 验证所需的所有 token）
+  const browserCookies = process.env.BROWSER_COOKIES;
+  if (browserCookies) {
+    let fullCookie = browserCookies.trim();
+    if (fullCookie.endsWith(';')) fullCookie = fullCookie.slice(0, -1);
+
+    const criticalCookies: Record<string, string> = {
+      sessionid: token,
+      sid_tt: token,
+      sessionid_ss: token,
+      uid_tt: USER_ID,
+      uid_tt_ss: USER_ID,
+    };
+    for (const [name, value] of Object.entries(criticalCookies)) {
+      const regex = new RegExp(`${name}=[^;]*`);
+      if (regex.test(fullCookie)) {
+        fullCookie = fullCookie.replace(regex, `${name}=${value}`);
+      } else {
+        fullCookie += `; ${name}=${value}`;
+      }
+    }
+
+    if (!fullCookie.includes('ttwid=')) {
+      const ttwid = await getTtwid();
+      if (ttwid) fullCookie += `; ttwid=${ttwid}`;
+    }
+
+    logger.info(`使用浏览器 cookie, 长度: ${fullCookie.length}, 包含 sessionid: ${fullCookie.includes('sessionid=')}`);
+    return fullCookie;
+  }
+
+  const ttwid = await getTtwid();
+
+  const cookies = [
     `_tea_web_id=${WEB_ID}`,
     `is_staff_user=false`,
     `sid_guard=${token}%7C${util.unixTimestamp()}%7C5184000%7CMon%2C+03-Feb-2025+08%3A17%3A09+GMT`,
@@ -174,7 +251,13 @@ export function generateCookie(refreshToken: string) {
     `sid_tt=${token}`,
     `sessionid=${token}`,
     `sessionid_ss=${token}`,
-  ].join("; ");
+  ];
+
+  if (ttwid) {
+    cookies.push(`ttwid=${ttwid}`);
+  }
+
+  return cookies.join("; ");
 }
 
 /**
@@ -232,6 +315,71 @@ export async function receiveCredit(refreshToken: string) {
  * @param params 请求参数
  * @param headers 请求头
  */
+/**
+ * 通过浏览器代理发送请求（绕过 TLS 指纹检测）
+ * 当 BROWSER_PROXY_URL 环境变量设置时，将请求通过 Playwright 浏览器代理转发
+ */
+async function requestViaBrowserProxy(
+  browserProxyUrl: string,
+  method: string,
+  fullUrl: string,
+  params: Record<string, any>,
+  headers: Record<string, any>,
+  data: any,
+  sessionToken: string
+): Promise<any> {
+  // Build URL with query params
+  const url = new URL(fullUrl);
+  for (const [k, v] of Object.entries(params)) {
+    url.searchParams.set(k, String(v));
+  }
+
+  // Only pass essential headers — browser fetch sets its own Sec-*, User-Agent, etc.
+  // Passing forbidden headers (Sec-Fetch-*, Accept-Encoding, User-Agent) can cause issues
+  const proxyHeaders: Record<string, any> = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+  };
+  // Copy custom API headers that the server needs
+  for (const key of ["Device-Time", "Sign", "Sign-Ver", "Appvr", "Pf", "Appid"]) {
+    if (headers[key] !== undefined) {
+      proxyHeaders[key] = headers[key];
+    }
+  }
+
+  const proxyPayload = {
+    url: url.toString(),
+    method: method.toUpperCase(),
+    headers: proxyHeaders,
+    body: data || null,
+    session_id: sessionToken,
+  };
+
+  logger.info(`[浏览器代理] 转发请求: ${method.toUpperCase()} ${url.pathname}`);
+
+  const resp = await axios.post(`${browserProxyUrl}/proxy`, proxyPayload, {
+    timeout: 120000,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  const proxyResult = resp.data;
+  if (proxyResult.error) {
+    throw new Error(`Browser proxy error: ${proxyResult.error}`);
+  }
+
+  logger.info(`[浏览器代理] 响应状态: ${proxyResult.status}`);
+  const dataSummary = JSON.stringify(proxyResult.data).substring(0, 500);
+  logger.info(`[浏览器代理] 响应数据摘要: ${dataSummary}`);
+
+  // Wrap in axios-like response object for checkResult()
+  return {
+    status: proxyResult.status,
+    statusText: proxyResult.status === 200 ? "OK" : "Error",
+    data: proxyResult.data,
+    headers: {},
+  };
+}
+
 export async function request(
   method: string,
   uri: string,
@@ -241,7 +389,8 @@ export async function request(
   const { token: tokenWithRegion, proxyUrl } = parseProxyFromToken(refreshToken);
   const regionInfo = parseRegionFromToken(tokenWithRegion);
   const { isUS, isHK, isJP, isSG } = regionInfo;
-  await acquireToken(regionInfo.isInternational ? tokenWithRegion.substring(3) : tokenWithRegion);
+  const sessionToken = regionInfo.isInternational ? tokenWithRegion.substring(3) : tokenWithRegion;
+  await acquireToken(sessionToken);
   const deviceTime = util.unixTimestamp();
   const sign = util.md5(
     `9e2c|${uri.slice(-7)}|${PLATFORM_CODE}|${VERSION_CODE}|${deviceTime}||11ac`
@@ -305,7 +454,7 @@ export async function request(
     Referer: origin,
     "App-Sdk-Version": "48.0.0",
     Appid: aid,
-    Cookie: generateCookie(tokenWithRegion),
+    Cookie: await generateCookie(tokenWithRegion),
     "Device-Time": deviceTime,
     Lan: isUS ? "en" : isJP ? "ja" : (isHK || isSG) ? "en" : "zh-Hans",
     Loc: isUS ? "us" : isJP ? "jp" : isHK ? "hk" : isSG ? "sg" : "cn",
@@ -322,6 +471,30 @@ export async function request(
   }
   logger.info(`请求参数: ${JSON.stringify(requestParams)}`);
   logger.info(`请求数据: ${JSON.stringify(options.data || {})}`);
+
+  // 浏览器代理模式：通过 Playwright 浏览器转发请求以绕过 TLS 指纹检测（shark）
+  const browserProxyUrl = process.env.BROWSER_PROXY_URL;
+  if (browserProxyUrl && options.responseType !== "stream") {
+    try {
+      const proxyResponse = await requestViaBrowserProxy(
+        browserProxyUrl, method, fullUrl, requestParams, headers, options.data, sessionToken
+      );
+      return checkResult(proxyResponse);
+    } catch (error: any) {
+      // 只有在浏览器代理本身不可用时才回退（网络错误、代理服务宕机等）
+      // API 返回的业务错误（如 invalid parameter）不回退，直接抛出
+      const isProxyDown = error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET' ||
+        error.code === 'ETIMEDOUT' || error.message?.includes('Browser proxy error') ||
+        error.message?.includes('socket hang up') || error.message?.includes('ECONNABORTED');
+      if (isProxyDown) {
+        logger.warn(`[浏览器代理] 不可用，回退到直连: ${error.message}`);
+      } else {
+        // API 业务错误，直接抛出，不要回退到直连（会被 shark 拦截）
+        logger.error(`[浏览器代理] API 错误: ${error.message}`);
+        throw error;
+      }
+    }
+  }
 
   const proxyAgent = proxyUrl
     ? (proxyUrl.toLowerCase().startsWith("socks")
