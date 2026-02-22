@@ -122,12 +122,7 @@ export default {
                 if (totalCount > 12) {
                     throw new Error('全能模式图片+视频总数不超过12个');
                 }
-                if (totalCount === 0) {
-                    const hasFilePaths = (request.body.filePaths?.length > 0) || (request.body.file_paths?.length > 0);
-                    if (!hasFilePaths) {
-                        throw new Error('全能模式至少需要上传1个素材文件(图片或视频)');
-                    }
-                }
+                // 纯 prompt 也支持，不再强制要求素材
             } else {
                 // 普通模式验证逻辑（保持原有逻辑）
                 const uploadedFiles = request.files ? _.values(request.files) : [];
