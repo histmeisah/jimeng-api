@@ -354,11 +354,10 @@ export async function generateVideo(
       if (!videoFields.includes('video_file')) videoFields.push('video_file');
     }
 
-    // 检查是否有素材
     const hasFilePaths = filePaths && filePaths.length > 0;
+    // 纯 prompt 也可以生成视频，不再强制要求素材
     if (imageFields.length === 0 && videoFields.length === 0 && audioFields.length === 0 && !hasFilePaths) {
-      throw new APIException(EX.API_REQUEST_FAILED,
-        `omni_reference 模式需要至少上传一个素材文件 (image_file_*, video_file_*, audio_file_*) 或提供素材URL`);
+      logger.info(`[omni] 纯 prompt 模式，无素材上传`);
     }
 
     let totalVideoDuration = 0; // 累计视频时长
